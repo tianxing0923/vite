@@ -2,6 +2,7 @@
 const path = require('path')
 const { createHash } = require('crypto')
 const { build } = require('vite')
+const MagicString = require('magic-string').default
 
 // lazy load babel since it's not used during dev
 let babel
@@ -16,6 +17,8 @@ const safari10NoModuleFix = `!function(){var e=document,t=e.createElement("scrip
 
 const legacyEntryId = 'vite-legacy-entry'
 const systemJSInlineCode = `System.import(document.getElementById('${legacyEntryId}').getAttribute('data-src'))`
+
+const legacyEnvVarMarker = `__VITE_IS_LEGACY__`
 
 /**
  * @param {import('.').Options} options
@@ -178,13 +181,34 @@ function viteLegacyPlugin(options = {}) {
     renderChunk(raw, chunk, opts) {
       if (!isLegacyOutput(opts)) {
         if (
-          !options.modernPolyfills ||
-          Array.isArray(options.modernPolyfills)
+          options.modernPolyfills &&
+          !Array.isArray(options.modernPolyfills)
         ) {
-          return null
+          // analyze and record modern polyfills
+          detectPolyfills(raw, { esmodules: true }, modernPolyfills)
         }
-        // analyze and record modern polyfills
-        detectPolyfills(raw, { esmodules: true }, modernPolyfills)
+
+        if (raw.includes(legacyEnvVarMarker)) {
+          const re = new RegExp(legacyEnvVarMarker, 'g')
+          if (config.build.sourcemap) {
+            const s = new MagicString(raw)
+            let match
+            while ((match = re.exec(raw))) {
+              s.overwrite(
+                match.index,
+                match.index + legacyEnvVarMarker.length,
+                `false`
+              )
+            }
+            return {
+              code: s.toString(),
+              map: s.generateMap({ hires: true })
+            }
+          } else {
+            return raw.replace(re, `false`)
+          }
+        }
+
         return null
       }
 
@@ -201,12 +225,22 @@ function viteLegacyPlugin(options = {}) {
 
       // transform the legacy chunk with @babel/preset-env
       const sourceMaps = !!config.build.sourcemap
-      let { code, ast, map } = loadBabel().transform(raw, {
-        ast: true,
+      const { code, map } = loadBabel().transform(raw, {
         configFile: false,
+        compact: true,
         sourceMaps,
         inputSourceMap: sourceMaps && chunk.map,
         presets: [
+          // forcing our plugin to run before preset-env by wrapping it in a
+          // preset so we can catch the injected import statements...
+          [
+            () => ({
+              plugins: [
+                recordAndRemovePolyfillBabelPlugin(legacyPolyfills),
+                replaceLegacyEnvBabelPlugin()
+              ]
+            })
+          ],
           [
             'env',
             {
@@ -224,20 +258,6 @@ function viteLegacyPlugin(options = {}) {
           ]
         ]
       })
-
-      if (needPolyfills) {
-        // detect and remove polyfill imports. Since the legacy bundle uses
-        // format: 'system', any import declarations are polyfill imports injected
-        // by @babel/preset-env.
-        for (const node of ast.program.body) {
-          if (node.type === 'ImportDeclaration') {
-            legacyPolyfills.add(node.source.value)
-          }
-        }
-        // remove import declarations, perserve line positions so we don't need
-        // to generate a source map again.
-        code = code.replace(/^import ".*";/gm, '//')
-      }
 
       return { code, map }
     },
@@ -265,7 +285,7 @@ function viteLegacyPlugin(options = {}) {
           tag: 'script',
           attrs: {
             type: 'module',
-            src: `${config.build.base}${modernPolyfillFilename}`
+            src: `${config.base}${modernPolyfillFilename}`
           }
         })
       } else if (modernPolyfills.size) {
@@ -295,7 +315,7 @@ function viteLegacyPlugin(options = {}) {
           tag: 'script',
           attrs: {
             nomodule: true,
-            src: `${config.build.base}${legacyPolyfillFilename}`
+            src: `${config.base}${legacyPolyfillFilename}`
           },
           injectTo: 'body'
         })
@@ -318,7 +338,7 @@ function viteLegacyPlugin(options = {}) {
             // script content will stay consistent - which allows using a constant
             // hash value for CSP.
             id: legacyEntryId,
-            'data-src': config.build.base + legacyEntryFilename
+            'data-src': config.base + legacyEntryFilename
           },
           children: systemJSInlineCode,
           injectTo: 'body'
@@ -347,7 +367,37 @@ function viteLegacyPlugin(options = {}) {
     }
   }
 
-  return [legacyGenerateBundlePlugin, legacyPostPlugin]
+  let envInjectionFailed = false
+  /**
+   * @type {import('vite').Plugin}
+   */
+  const legacyEnvPlugin = {
+    name: 'legacy-env',
+
+    config(_, env) {
+      if (env) {
+        return {
+          define: {
+            'import.meta.env.LEGACY':
+              env.command === 'serve' ? false : legacyEnvVarMarker
+          }
+        }
+      } else {
+        envInjectionFailed = true
+      }
+    },
+
+    configResolved(config) {
+      if (envInjectionFailed) {
+        config.logger.warn(
+          `[@vitejs/plugin-legacy] import.meta.env.LEGACY was not injected due ` +
+            `to incompatible vite version (requires vite@^2.0.0-beta.69).`
+        )
+      }
+    }
+  }
+
+  return [legacyGenerateBundlePlugin, legacyPostPlugin, legacyEnvPlugin]
 }
 
 /**
@@ -418,7 +468,8 @@ async function buildPolyfillChunk(
           [name]: polyfillId
         },
         output: {
-          format: name.includes('legacy') ? 'iife' : 'es'
+          format: name.includes('legacy') ? 'iife' : 'es',
+          manualChunks: undefined
         }
       }
     }
@@ -472,6 +523,40 @@ function isLegacyOutput(options) {
     typeof options.entryFileNames === 'string' &&
     options.entryFileNames.includes('-legacy')
   )
+}
+
+/**
+ * @param {Set<string>} polyfills
+ */
+function recordAndRemovePolyfillBabelPlugin(polyfills) {
+  return ({ types: t }) => ({
+    name: 'vite-remove-polyfill-import',
+    visitor: {
+      Program: {
+        exit(path) {
+          path.get('body').forEach((p) => {
+            if (t.isImportDeclaration(p)) {
+              polyfills.add(p.node.source.value)
+              p.remove()
+            }
+          })
+        }
+      }
+    }
+  })
+}
+
+function replaceLegacyEnvBabelPlugin() {
+  return ({ types: t }) => ({
+    name: 'vite-replace-env-legacy',
+    visitor: {
+      Identifier(path) {
+        if (path.node.name === legacyEnvVarMarker) {
+          path.replaceWith(t.booleanLiteral(true))
+        }
+      }
+    }
+  })
 }
 
 module.exports = viteLegacyPlugin

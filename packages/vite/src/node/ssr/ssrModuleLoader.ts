@@ -1,6 +1,7 @@
+import fs from 'fs'
 import path from 'path'
 import { ViteDevServer } from '..'
-import { resolveFrom } from '../utils'
+import { cleanUrl, resolveFrom, unwrapId } from '../utils'
 import { ssrRewriteStacktrace } from './ssrStacktrace'
 import {
   ssrExportAllKey,
@@ -18,10 +19,11 @@ interface SSRContext {
 export async function ssrLoadModule(
   url: string,
   server: ViteDevServer,
-  isolated: boolean,
-  context: SSRContext = { global: isolated ? Object.create(global) : global },
+  context: SSRContext = { global },
   urlStack: string[] = []
 ): Promise<Record<string, any>> {
+  url = unwrapId(url)
+
   if (urlStack.includes(url)) {
     server.config.logger.warn(
       `Circular dependency: ${urlStack.join(' -> ')} -> ${url}`
@@ -32,7 +34,7 @@ export async function ssrLoadModule(
   const { moduleGraph } = server
   const mod = await moduleGraph.ensureEntryFromUrl(url)
 
-  if (!isolated && mod.ssrModule) {
+  if (mod.ssrModule) {
     return mod.ssrModule
   }
 
@@ -41,7 +43,7 @@ export async function ssrLoadModule(
     (await transformRequest(url, server, { ssr: true }))
   if (!result) {
     // TODO more info? is this even necessary?
-    throw new Error(`failed to load module for ssr: $${url}`)
+    throw new Error(`failed to load module for ssr: ${url}`)
   }
 
   const isExternal = (dep: string) => dep[0] !== '.' && dep[0] !== '/'
@@ -49,13 +51,7 @@ export async function ssrLoadModule(
   await Promise.all(
     result.deps!.map((dep) => {
       if (!isExternal(dep)) {
-        return ssrLoadModule(
-          dep,
-          server,
-          isolated,
-          context,
-          urlStack.concat(url)
-        )
+        return ssrLoadModule(dep, server, context, urlStack.concat(url))
       }
     })
   )
@@ -69,17 +65,17 @@ export async function ssrLoadModule(
 
   const ssrImport = (dep: string) => {
     if (isExternal(dep)) {
-      return nodeRequire(dep, mod.file)
+      return nodeRequire(dep, mod.file, server.config.root)
     } else {
-      return moduleGraph.urlToModuleMap.get(dep)?.ssrModule
+      return moduleGraph.urlToModuleMap.get(unwrapId(dep))?.ssrModule
     }
   }
 
   const ssrDynamicImport = (dep: string) => {
     if (isExternal(dep)) {
-      return Promise.resolve(nodeRequire(dep, mod.file))
+      return Promise.resolve(nodeRequire(dep, mod.file, server.config.root))
     } else {
-      return ssrLoadModule(dep, server, isolated, context, urlStack.concat(url))
+      return ssrLoadModule(dep, server, context, urlStack.concat(url))
     }
   }
 
@@ -118,24 +114,41 @@ export async function ssrLoadModule(
       `Error when evaluating SSR module ${url}:\n${e.stack}`,
       {
         timestamp: true,
-        clear: true
+        clear: server.config.clearScreen
       }
     )
+    throw e
   }
 
   mod.ssrModule = ssrModule
   return ssrModule
 }
 
-function nodeRequire(id: string, importer: string | null) {
-  const mod = importer
-    ? require(resolveFrom(id, path.dirname(importer)))
-    : require(id)
+function nodeRequire(id: string, importer: string | null, root: string) {
+  const mod = require(resolve(id, importer, root))
+  const defaultExport = mod.__esModule ? mod.default : mod
   // rollup-style default import interop for cjs
   return new Proxy(mod, {
     get(mod, prop) {
-      if (prop === 'default') return mod
+      if (prop === 'default') return defaultExport
       return mod[prop]
     }
   })
+}
+
+const resolveCache = new Map<string, string>()
+
+function resolve(id: string, importer: string | null, root: string) {
+  const key = id + importer + root
+  const cached = resolveCache.get(key)
+  if (cached) {
+    return cached
+  }
+  const resolveDir =
+    importer && fs.existsSync(cleanUrl(importer))
+      ? path.dirname(importer)
+      : root
+  const resolved = resolveFrom(id, resolveDir, true)
+  resolveCache.set(key, resolved)
+  return resolved
 }

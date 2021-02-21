@@ -105,7 +105,8 @@ export async function transformMain(
   if (devServer && !ssr && !isProduction) {
     output.push(`_sfc_main.__hmrId = ${JSON.stringify(descriptor.id)}`)
     output.push(
-      `__VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main)`
+      `typeof __VUE_HMR_RUNTIME__ !== 'undefined' && ` +
+        `__VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main)`
     )
     // check if the template is the only thing that changed
     if (prevDescriptor && isOnlyTemplateChanged(prevDescriptor, descriptor)) {
@@ -206,6 +207,8 @@ async function genTemplateCode(
   }
 }
 
+const exportDefaultClassRE = /export\s+default\s+class\s+([\w$]+)/
+
 async function genScriptCode(
   descriptor: SFCDescriptor,
   options: ResolvedOptions,
@@ -225,7 +228,14 @@ async function genScriptCode(
       (!script.lang || (script.lang === 'ts' && options.devServer)) &&
       !script.src
     ) {
-      scriptCode = rewriteDefault(script.content, `_sfc_main`)
+      const classMatch = script.content.match(exportDefaultClassRE)
+      if (classMatch) {
+        scriptCode =
+          script.content.replace(exportDefaultClassRE, `class $1`) +
+          `\nconst _sfc_main = ${classMatch[1]}`
+      } else {
+        scriptCode = rewriteDefault(script.content, `_sfc_main`)
+      }
       map = script.map
       if (script.lang === 'ts') {
         const result = await options.devServer!.transformWithEsbuild(
@@ -339,7 +349,9 @@ async function linkSrcToDescriptor(
 ) {
   const srcFile =
     (await pluginContext.resolve(src, descriptor.filename))?.id || src
-  setDescriptor(srcFile, descriptor)
+  // #1812 if the src points to a dep file, the resolved id may contain a
+  // version query.
+  setDescriptor(srcFile.replace(/\?.*$/, ''), descriptor)
 }
 
 // these are built-in query parameters so should be ignored

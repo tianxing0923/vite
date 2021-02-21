@@ -1,6 +1,6 @@
 import fs from 'fs'
 import path from 'path'
-import { tryNodeResolve } from '../plugins/resolve'
+import { tryNodeResolve, InternalResolveOptions } from '../plugins/resolve'
 import { lookupFile, resolveFrom } from '../utils'
 import { ResolvedConfig } from '..'
 
@@ -13,6 +13,7 @@ import { ResolvedConfig } from '..'
  */
 export function resolveSSRExternal(
   config: ResolvedConfig,
+  knownImports: string[],
   ssrExternals: Set<string> = new Set()
 ): string[] {
   const { root } = config
@@ -22,18 +23,26 @@ export function resolveSSRExternal(
   }
   const pkg = JSON.parse(pkgContent)
   const devDeps = Object.keys(pkg.devDependencies || {})
-  const deps = Object.keys(pkg.dependencies || {})
+  const deps = [...knownImports, ...Object.keys(pkg.dependencies || {})]
 
   for (const id of devDeps) {
     ssrExternals.add(id)
   }
 
+  const resolveOptions: InternalResolveOptions = {
+    root,
+    isProduction: false,
+    isBuild: true
+  }
+
   for (const id of deps) {
-    const entry = tryNodeResolve(id, root, false)?.id
+    let entry
     let requireEntry
     try {
+      entry = tryNodeResolve(id, undefined, resolveOptions)?.id
       requireEntry = require.resolve(id, { paths: [root] })
     } catch (e) {
+      // resolve failed, assume include
       continue
     }
     if (!entry) {
@@ -55,6 +64,7 @@ export function resolveSSRExternal(
           ...config,
           root: depRoot
         },
+        knownImports,
         ssrExternals
       )
       continue
@@ -79,5 +89,22 @@ export function resolveSSRExternal(
   if (config.ssr?.noExternal) {
     externals = externals.filter((id) => !config.ssr!.noExternal!.includes(id))
   }
-  return externals
+  return externals.filter((id) => id !== 'vite')
+}
+
+export function shouldExternalizeForSSR(
+  id: string,
+  externals: string[]
+): boolean {
+  const should = externals.some((e) => {
+    if (id === e) {
+      return true
+    }
+    // deep imports, check ext before externalizing - only externalize
+    // extension-less imports and explicit .js imports
+    if (id.startsWith(e + '/') && (!path.extname(id) || id.endsWith('.js'))) {
+      return true
+    }
+  })
+  return should
 }
